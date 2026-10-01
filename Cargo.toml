@@ -1,0 +1,24 @@
+[package]
+name = "nago-acme"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "DNS-01 ACME certificates over nagoya and nago-http"
+repository = "https://github.com/pathscale/nago-acme"
+readme = "README.md"
+keywords = ["acme", "letsencrypt", "dns", "certificates", "no-runtime"]
+categories = ["web-programming", "cryptography"]
+
+[features]
+default = []
+s3 = []
+
+[dependencies]
+nagoya = { version = "^0.1", features = ["reactor"] }
+nago-http = "^0.1"
+ring = "^0.17"
+rcgen = "^0.14"
+x509-parser = "^0.16"
+serde = { version = "^1", features = ["derive"] }
+serde_json = "^1"
+thiserror = "^2"
