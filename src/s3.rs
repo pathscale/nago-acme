@@ -613,7 +613,9 @@ mod tests {
     use super::*;
 
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    const ACCESS: &str = "[REDACTED AWS TEST KEY]";
+    // Public SigV4 example credentials from the AWS S3 signing documentation;
+    // these are fixed test-vector inputs, not deployable credentials.
+    const ACCESS: &str = "AKIAIOSFODNN7EXAMPLE";
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
     const EMPTY_HASH: &str = EMPTY_SHA256;
 
@@ -638,7 +640,7 @@ mod tests {
         );
         assert_eq!(
             authorization,
-            "AWS4-HMAC-SHA256 Credential=[REDACTED AWS TEST KEY]/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,Signature=[REDACTED TEST SIGNATURE]"
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
         );
     }
 
@@ -667,7 +669,7 @@ mod tests {
         );
         assert_eq!(
             authorization,
-            "AWS4-HMAC-SHA256 Credential=[REDACTED AWS TEST KEY]/20130524/us-east-1/s3/aws4_request,SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class,Signature=[REDACTED TEST SIGNATURE]"
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class,Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"
         );
     }
 
