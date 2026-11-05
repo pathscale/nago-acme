@@ -67,6 +67,7 @@ impl BackgroundGuard {
         }
     }
 
+    #[cfg(feature = "s3")]
     pub(crate) fn holding(guard: BackgroundGuard) -> Self {
         let state = guard.state.clone();
         Self {
