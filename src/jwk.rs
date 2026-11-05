@@ -74,25 +74,31 @@ fn thumbprint_fields(fields: &[(&str, &str)]) -> String {
     sha256_base64url(canonical.as_bytes())
 }
 
-/// A locally held ES256 account key.
+/// An ES256 account key held in process memory.
+///
+/// This type intentionally does not implement `Debug` so formatting it cannot
+/// expose the private key. Applications may load or save its PKCS#8 bytes with
+/// an OS keychain or key agent.
 #[derive(Clone)]
-pub(crate) struct AccountKey {
+pub struct AccountKey {
     pkcs8: Vec<u8>,
     jwk: EcJwk,
 }
 
 impl AccountKey {
-    pub(crate) fn generate() -> Result<Self> {
+    /// Generate a new ES256 account key.
+    pub fn generate() -> Result<Self> {
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
             .map_err(|_| Error::Account("could not generate the ES256 account key".into()))?;
         Self::from_pkcs8(pkcs8.as_ref().to_vec())
     }
 
-    pub(crate) fn from_pkcs8(pkcs8: Vec<u8>) -> Result<Self> {
+    /// Load an ES256 account key from PKCS#8 bytes in memory.
+    pub fn from_pkcs8(pkcs8: Vec<u8>) -> Result<Self> {
         let rng = SystemRandom::new();
         let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8, &rng)
-            .map_err(|_| Error::Account("cached account key is not a P-256 key".into()))?;
+            .map_err(|_| Error::Account("account key is not a P-256 key".into()))?;
         let public = pair.public_key().as_ref();
         if public.len() != 65 || public[0] != 4 {
             return Err(Error::Account(
@@ -118,7 +124,10 @@ impl AccountKey {
         self.jwk.thumbprint()
     }
 
-    pub(crate) fn pkcs8(&self) -> &[u8] {
+    /// Return the PKCS#8 bytes so an application can keep the key in its OS
+    /// keychain or key agent.
+    #[must_use]
+    pub fn pkcs8(&self) -> &[u8] {
         &self.pkcs8
     }
 
