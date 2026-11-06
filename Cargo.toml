@@ -8,6 +8,7 @@ repository = "https://github.com/pathscale/nago-acme"
 readme = "README.md"
 keywords = ["acme", "letsencrypt", "dns", "certificates", "no-runtime"]
 categories = ["web-programming", "cryptography"]
+publish = ["crates-io"]
 
 [features]
 default = []
