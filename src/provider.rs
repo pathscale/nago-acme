@@ -441,10 +441,12 @@ mod tests {
         ));
         std::fs::create_dir(&cert_dir).expect("create isolated test directory");
 
-        let fullchain = b"-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n";
-        let private_key = b"test-only-private-key-marker";
-        let certificate = CertificateMaterial::new(fullchain.to_vec(), private_key.to_vec())
-            .expect("synthetic public chain and test key are accepted");
+        let generated = rcgen::generate_simple_self_signed(vec!["example.test".to_owned()])
+            .expect("generate test certificate");
+        let fullchain = generated.cert.pem().into_bytes();
+        let private_key = generated.signing_key.serialize_pem().into_bytes();
+        let certificate = CertificateMaterial::new(fullchain.clone(), private_key.clone())
+            .expect("generated certificate and matching test key are accepted");
         let state = AcmeState::new();
 
         install_certificate(&cert_dir, &state, certificate).expect("install public chain");
