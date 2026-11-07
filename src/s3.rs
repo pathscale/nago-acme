@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ring::hmac;
 use serde::Deserialize;
 
+use crate::certificate::validate_public_certificate_chain;
 use crate::error::{Error, Result};
 use crate::provider::{BackgroundGuard, CertProvider, ProviderFuture};
 
@@ -65,7 +66,7 @@ impl S3Config {
     }
 }
 
-/// Certificate and account-cache synchronization with an S3-compatible store.
+/// Public certificate-chain synchronization with an S3-compatible store.
 pub struct S3CertSync {
     config: S3Config,
     endpoint: Endpoint,
@@ -115,7 +116,7 @@ impl S3CertSync {
         self
     }
 
-    /// Upload any present certificate, private-key, and account-cache files.
+    /// Upload the public certificate chain from `fullchain.pem`.
     pub async fn push_from(&self, cert_dir: &Path) -> Result<()> {
         for relative in stored_files() {
             let path = cert_dir.join(relative);
@@ -124,34 +125,35 @@ impl S3CertSync {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
-            self.put_object(&self.object_key(relative), &body).await?;
+            validate_public_certificate_chain(&body)?;
+            self.put_certificate_chain(&body).await?;
         }
         Ok(())
     }
 
-    /// Download any present stored files into the certificate directory.
-    /// Missing objects are ignored so a new store can be initialized.
+    /// Download a public certificate chain into the certificate directory.
+    /// Missing objects are ignored. Private keys and account keys are never
+    /// synchronized.
     pub async fn pull_to(&self, cert_dir: &Path) -> Result<()> {
         for relative in stored_files() {
             let Some(body) = self.get_object(&self.object_key(relative)).await? else {
                 continue;
             };
+            validate_public_certificate_chain(&body)?;
             let path = cert_dir.join(relative);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            if relative == "privkey.pem" || relative == "acme_cache/acme_account_credentials.json" {
-                crate::acme::write_secret_file(&path, &body)?;
-            } else {
-                std::fs::write(path, body)?;
-            }
+            std::fs::write(path, body)?;
         }
         Ok(())
     }
 
-    /// Upload one object.
-    pub async fn put_object(&self, key: &str, body: &[u8]) -> Result<()> {
-        let response = self.request("PUT", key, body).await?;
+    async fn put_certificate_chain(&self, body: &[u8]) -> Result<()> {
+        validate_public_certificate_chain(body)?;
+        let response = self
+            .request("PUT", &self.object_key("fullchain.pem"), body)
+            .await?;
         if !(200..300).contains(&response.status) {
             return Err(http_error(
                 "S3 object upload",
@@ -367,8 +369,8 @@ impl S3CertSync {
     }
 }
 
-/// Wrap a certificate provider so remote files are pulled before provisioning
-/// and pushed after the initial certificate is ready.
+/// Wrap a certificate provider so the public chain is pulled before
+/// provisioning and pushed after the initial certificate is ready.
 pub struct S3CertProvider<P: CertProvider> {
     inner: P,
     sync: std::sync::Arc<S3CertSync>,
@@ -466,12 +468,8 @@ impl Endpoint {
     }
 }
 
-fn stored_files() -> [&'static str; 3] {
-    [
-        "fullchain.pem",
-        "privkey.pem",
-        "acme_cache/acme_account_credentials.json",
-    ]
+fn stored_files() -> [&'static str; 1] {
+    ["fullchain.pem"]
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -615,6 +613,8 @@ mod tests {
     use super::*;
 
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    // Public SigV4 example credentials from the AWS S3 signing documentation;
+    // these are fixed test-vector inputs, not deployable credentials.
     const ACCESS: &str = "AKIAIOSFODNN7EXAMPLE";
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
     const EMPTY_HASH: &str = EMPTY_SHA256;
@@ -681,5 +681,10 @@ mod tests {
             endpoint.object_path("certs", "site name/fullchain.pem"),
             "/s3/certs/site%20name/fullchain.pem"
         );
+    }
+
+    #[test]
+    fn s3_sync_transfers_only_the_public_chain() {
+        assert_eq!(stored_files(), ["fullchain.pem"]);
     }
 }
