@@ -1,8 +1,25 @@
 use thiserror::Error;
 
+/// Why startup could not use restored ACME credentials.
+#[derive(Debug, Error)]
+pub enum RestoreError {
+    /// The caller reported that restoration did not complete successfully.
+    #[error("the application could not restore ACME credentials")]
+    Failed,
+    /// No certificate chain with a matching private key was restored.
+    #[error("restored certificate material is missing")]
+    MissingCertificate,
+    /// No ACME account key was restored.
+    #[error("restored ACME account key is missing")]
+    MissingAccountKey,
+}
+
 /// Errors returned while provisioning or syncing certificates.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// Startup requires credentials restored by the application.
+    #[error("ACME restore error: {0}")]
+    Restore(#[from] RestoreError),
     /// Invalid local configuration or certificate material.
     #[error("configuration error: {0}")]
     Config(String),
