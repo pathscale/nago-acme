@@ -1,6 +1,6 @@
 [package]
 name = "nago-acme"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "DNS-01 ACME certificates over nagoya and nago-http"
@@ -8,6 +8,7 @@ repository = "https://github.com/pathscale/nago-acme"
 readme = "README.md"
 keywords = ["acme", "letsencrypt", "dns", "certificates", "no-runtime"]
 categories = ["web-programming", "cryptography"]
+publish = ["crates-io"]
 
 [features]
 default = []
@@ -22,3 +23,7 @@ x509-parser = "^0.16"
 serde = { version = "^1", features = ["derive"] }
 serde_json = "^1"
 thiserror = "^2"
+zeroize = { version = "^1", features = ["alloc"] }
+
+[dev-dependencies]
+rcgen = { version = "^0.14", features = ["x509-parser"] }

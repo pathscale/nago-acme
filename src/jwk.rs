@@ -4,6 +4,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
@@ -74,25 +75,33 @@ fn thumbprint_fields(fields: &[(&str, &str)]) -> String {
     sha256_base64url(canonical.as_bytes())
 }
 
-/// A locally held ES256 account key.
+/// An ES256 account key held in process memory.
+///
+/// This type intentionally does not implement `Debug` so formatting it cannot
+/// expose the private key. Applications may load or save its PKCS#8 bytes with
+/// an OS keychain or key agent.
 #[derive(Clone)]
-pub(crate) struct AccountKey {
-    pkcs8: Vec<u8>,
+pub struct AccountKey {
+    pkcs8: Zeroizing<Vec<u8>>,
     jwk: EcJwk,
 }
 
 impl AccountKey {
-    pub(crate) fn generate() -> Result<Self> {
+    /// Generate a new ES256 account key.
+    pub fn generate() -> Result<Self> {
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
             .map_err(|_| Error::Account("could not generate the ES256 account key".into()))?;
         Self::from_pkcs8(pkcs8.as_ref().to_vec())
     }
 
-    pub(crate) fn from_pkcs8(pkcs8: Vec<u8>) -> Result<Self> {
+    /// Load an ES256 account key from PKCS#8 bytes in memory.
+    pub fn from_pkcs8(pkcs8: Vec<u8>) -> Result<Self> {
+        let pkcs8 = Zeroizing::new(pkcs8);
         let rng = SystemRandom::new();
-        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8, &rng)
-            .map_err(|_| Error::Account("cached account key is not a P-256 key".into()))?;
+        let pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_slice(), &rng)
+                .map_err(|_| Error::Account("account key is not a P-256 key".into()))?;
         let public = pair.public_key().as_ref();
         if public.len() != 65 || public[0] != 4 {
             return Err(Error::Account(
@@ -118,14 +127,21 @@ impl AccountKey {
         self.jwk.thumbprint()
     }
 
-    pub(crate) fn pkcs8(&self) -> &[u8] {
-        &self.pkcs8
+    /// Return the PKCS#8 bytes so an application can keep the key in its OS
+    /// keychain or key agent.
+    #[must_use]
+    pub fn pkcs8(&self) -> &[u8] {
+        self.pkcs8.as_slice()
     }
 
     pub(crate) fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
         let rng = SystemRandom::new();
-        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &self.pkcs8, &rng)
-            .map_err(|_| Error::Account("could not load the ES256 account key".into()))?;
+        let pair = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            self.pkcs8.as_slice(),
+            &rng,
+        )
+        .map_err(|_| Error::Account("could not load the ES256 account key".into()))?;
         pair.sign(&rng, message)
             .map(|signature| signature.as_ref().to_vec())
             .map_err(|_| Error::Account("could not sign the ACME request".into()))
@@ -213,5 +229,24 @@ mod tests {
             .unwrap(),
             "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
         );
+    }
+
+    #[test]
+    fn account_key_import_revalidates_and_signs_generated_pkcs8() {
+        assert!(matches!(
+            AccountKey::from_pkcs8(vec![0; 8]),
+            Err(Error::Account(_))
+        ));
+
+        let generated = AccountKey::generate().expect("generate account key");
+        let pkcs8 = generated.pkcs8().to_vec();
+        let expected_len = pkcs8.len();
+        let imported = AccountKey::from_pkcs8(pkcs8).expect("reimport generated account key");
+        assert_eq!(imported.pkcs8().len(), expected_len);
+
+        let signature = imported
+            .sign(b"synthetic account import regression")
+            .expect("sign with reimported account key");
+        assert_eq!(signature.len(), 64);
     }
 }

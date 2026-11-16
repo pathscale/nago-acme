@@ -1,16 +1,36 @@
 //! S3-compatible certificate storage signed with AWS Signature Version 4.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ring::hmac;
 use serde::Deserialize;
 
+use crate::certificate::validate_public_certificate_chain;
 use crate::error::{Error, Result};
-use crate::provider::{BackgroundGuard, CertProvider, ProviderFuture};
+use crate::provider::{BackgroundGuard, CertProvider, ProviderFuture, replace_public_chain};
 
 const IMDS_ENDPOINT: &str = "http://169.254.169.254";
+
+static PUBLISHER_TARGETS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+/// Process-local ownership of one exact certificate-chain request URL.
+pub(crate) struct PublisherClaim {
+    target: String,
+}
+
+impl Drop for PublisherClaim {
+    fn drop(&mut self) {
+        if let Some(targets) = PUBLISHER_TARGETS.get() {
+            targets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.target);
+        }
+    }
+}
 
 /// Configuration for an S3-compatible object store.
 ///
@@ -65,7 +85,7 @@ impl S3Config {
     }
 }
 
-/// Certificate and account-cache synchronization with an S3-compatible store.
+/// Public certificate-chain synchronization with an S3-compatible store.
 pub struct S3CertSync {
     config: S3Config,
     endpoint: Endpoint,
@@ -115,8 +135,31 @@ impl S3CertSync {
         self
     }
 
-    /// Upload any present certificate, private-key, and account-cache files.
+    /// Upload the public certificate chain from `fullchain.pem`.
     pub async fn push_from(&self, cert_dir: &Path) -> Result<()> {
+        let _claim = self.claim_publisher()?;
+        self.push_from_claimed(cert_dir).await
+    }
+
+    pub(crate) fn publisher_target(&self) -> String {
+        self.object_url(&self.object_key("fullchain.pem"))
+    }
+
+    pub(crate) fn claim_publisher(&self) -> Result<PublisherClaim> {
+        let target = self.publisher_target();
+        let targets = PUBLISHER_TARGETS.get_or_init(|| Mutex::new(BTreeSet::new()));
+        let mut targets = targets
+            .lock()
+            .map_err(|_| Error::Config("S3 publisher ownership registry is poisoned".into()))?;
+        if !targets.insert(target.clone()) {
+            return Err(Error::Config(format!(
+                "an S3 publisher already owns certificate target {target}"
+            )));
+        }
+        Ok(PublisherClaim { target })
+    }
+
+    pub(crate) async fn push_from_claimed(&self, cert_dir: &Path) -> Result<()> {
         for relative in stored_files() {
             let path = cert_dir.join(relative);
             let body = match std::fs::read(&path) {
@@ -124,34 +167,31 @@ impl S3CertSync {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
-            self.put_object(&self.object_key(relative), &body).await?;
+            self.push_chain_claimed(&body).await?;
         }
         Ok(())
     }
 
-    /// Download any present stored files into the certificate directory.
-    /// Missing objects are ignored so a new store can be initialized.
+    /// Download a public certificate chain into the certificate directory.
+    /// Missing objects are ignored. Private keys and account keys are never
+    /// synchronized.
     pub async fn pull_to(&self, cert_dir: &Path) -> Result<()> {
         for relative in stored_files() {
             let Some(body) = self.get_object(&self.object_key(relative)).await? else {
                 continue;
             };
-            let path = cert_dir.join(relative);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            if relative == "privkey.pem" || relative == "acme_cache/acme_account_credentials.json" {
-                crate::acme::write_secret_file(&path, &body)?;
-            } else {
-                std::fs::write(path, body)?;
-            }
+            validate_public_certificate_chain(&body)?;
+            std::fs::create_dir_all(cert_dir)?;
+            replace_public_chain(cert_dir, &body)?;
         }
         Ok(())
     }
 
-    /// Upload one object.
-    pub async fn put_object(&self, key: &str, body: &[u8]) -> Result<()> {
-        let response = self.request("PUT", key, body).await?;
+    pub(crate) async fn push_chain_claimed(&self, body: &[u8]) -> Result<()> {
+        validate_public_certificate_chain(body)?;
+        let response = self
+            .request("PUT", &self.object_key("fullchain.pem"), body)
+            .await?;
         if !(200..300).contains(&response.status) {
             return Err(http_error(
                 "S3 object upload",
@@ -225,10 +265,7 @@ impl S3CertSync {
         if let Some(token) = credentials.session_token {
             headers.push(("x-amz-security-token".into(), token));
         }
-        let url = format!(
-            "{}://{}{}",
-            self.endpoint.scheme, self.endpoint.authority, path
-        );
+        let url = self.object_url(key);
         let client =
             nago_http::Client::global().map_err(|error| Error::HttpClient(error.to_string()))?;
         let headers: Vec<(&str, &str)> = headers
@@ -252,6 +289,14 @@ impl S3CertSync {
             status: response.status,
             body: response.body,
         })
+    }
+
+    fn object_url(&self, key: &str) -> String {
+        let path = self.endpoint.object_path(&self.config.bucket_name, key);
+        format!(
+            "{}://{}{}",
+            self.endpoint.scheme, self.endpoint.authority, path
+        )
     }
 
     async fn credentials(&self) -> Result<Credentials> {
@@ -367,8 +412,14 @@ impl S3CertSync {
     }
 }
 
-/// Wrap a certificate provider so remote files are pulled before provisioning
-/// and pushed after the initial certificate is ready.
+/// Wrap a certificate provider so the public chain is pulled before
+/// provisioning and pushed after the initial certificate is ready. The inner
+/// provider's startup preparation runs before any S3 request. A failed startup
+/// upload does not fail startup: the inner guard is kept and the upload of
+/// `fullchain.pem` is retried in the background while the returned guard lives.
+///
+/// The pull only matters for inner providers that read `cert_dir` at startup.
+/// `DnsAcmeProvider` restores from `AcmeState` and overwrites `fullchain.pem`.
 pub struct S3CertProvider<P: CertProvider> {
     inner: P,
     sync: std::sync::Arc<S3CertSync>,
@@ -383,17 +434,41 @@ impl<P: CertProvider> S3CertProvider<P> {
 }
 
 impl<P: CertProvider> CertProvider for S3CertProvider<P> {
+    fn publishes_to_s3_target(&self, target: &str) -> bool {
+        self.sync.publisher_target() == target || self.inner.publishes_to_s3_target(target)
+    }
+
     fn init<'a>(
         &'a mut self,
         cert_dir: PathBuf,
         domains: Option<Vec<String>>,
     ) -> ProviderFuture<'a> {
-        Box::pin(async move {
-            self.sync.pull_to(&cert_dir).await?;
-            let guard = self.inner.init(cert_dir.clone(), domains).await?;
-            self.sync.push_from(&cert_dir).await?;
-            Ok(BackgroundGuard::holding(guard))
-        })
+        Box::pin(async move { self.prepare_init(cert_dir, domains)?.await })
+    }
+
+    fn prepare_init<'a>(
+        &'a mut self,
+        cert_dir: PathBuf,
+        domains: Option<Vec<String>>,
+    ) -> Result<ProviderFuture<'a>> {
+        let sync = self.sync.clone();
+        let delegated = self.inner.publishes_to_s3_target(&sync.publisher_target());
+        let startup = self.inner.prepare_init(cert_dir.clone(), domains)?;
+        if delegated {
+            return Ok(startup);
+        }
+        Ok(Box::pin(async move {
+            let claim = sync.claim_publisher()?;
+            sync.pull_to(&cert_dir).await?;
+            let guard = startup.await?;
+            if sync.push_from_claimed(&cert_dir).await.is_err() {
+                // The inner provider may have issued a certificate during this
+                // startup that exists only in memory, so keep its guard and
+                // retry the upload instead of failing.
+                return Ok(BackgroundGuard::retrying_upload(guard, claim, sync, cert_dir));
+            }
+            Ok(BackgroundGuard::holding(guard, claim))
+        }))
     }
 }
 
@@ -466,12 +541,8 @@ impl Endpoint {
     }
 }
 
-fn stored_files() -> [&'static str; 3] {
-    [
-        "fullchain.pem",
-        "privkey.pem",
-        "acme_cache/acme_account_credentials.json",
-    ]
+fn stored_files() -> [&'static str; 1] {
+    ["fullchain.pem"]
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -615,6 +686,8 @@ mod tests {
     use super::*;
 
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    // Public SigV4 example credentials from the AWS S3 signing documentation;
+    // these are fixed test-vector inputs, not deployable credentials.
     const ACCESS: &str = "AKIAIOSFODNN7EXAMPLE";
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
     const EMPTY_HASH: &str = EMPTY_SHA256;
@@ -681,5 +754,10 @@ mod tests {
             endpoint.object_path("certs", "site name/fullchain.pem"),
             "/s3/certs/site%20name/fullchain.pem"
         );
+    }
+
+    #[test]
+    fn s3_sync_transfers_only_the_public_chain() {
+        assert_eq!(stored_files(), ["fullchain.pem"]);
     }
 }

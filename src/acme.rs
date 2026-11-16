@@ -1,21 +1,19 @@
 //! RFC 8555 client, order state machine, and certificate issuance flow.
 
 use std::collections::HashSet;
-use std::fs::OpenOptions;
 use std::future::Future;
-use std::io::Write;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+use crate::certificate::{AcmeState, CertificateMaterial};
 use crate::dns::DnsProvider;
 use crate::error::{Error, Result};
 use crate::jwk::{AccountKey, base64url_encode};
@@ -123,13 +121,6 @@ struct AcmeDirectory {
     new_order: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct CachedCredentials {
-    directory_url: String,
-    kid: String,
-    account_key_pkcs8_hex: String,
-}
-
 /// An authenticated ACME account session.
 pub(crate) struct AcmeClient {
     transport: Arc<dyn Transport>,
@@ -140,6 +131,10 @@ pub(crate) struct AcmeClient {
 }
 
 impl AcmeClient {
+    pub(crate) fn account_key(&self) -> &AccountKey {
+        &self.key
+    }
+
     fn new(
         transport: Arc<dyn Transport>,
         directory: AcmeDirectory,
@@ -250,32 +245,41 @@ fn response_is_bad_nonce(response: &HttpResponse) -> bool {
 }
 
 pub(crate) async fn load_or_create_account(
-    cache_dir: &Path,
     email: &str,
     production: bool,
+    state: &AcmeState,
+    transport: Arc<dyn Transport>,
+) -> Result<Arc<AcmeClient>> {
+    let key = match state.account_key() {
+        Some(key) => key,
+        None => {
+            let key = AccountKey::generate()?;
+            state.set_account_key(key.clone());
+            key
+        }
+    };
+    open_account(production, key, transport, Some(email)).await
+}
+
+pub(crate) async fn load_existing_account(
+    production: bool,
+    key: AccountKey,
+    transport: Arc<dyn Transport>,
+) -> Result<Arc<AcmeClient>> {
+    open_account(production, key, transport, None).await
+}
+
+async fn open_account(
+    production: bool,
+    key: AccountKey,
+    transport: Arc<dyn Transport>,
+    registration_email: Option<&str>,
 ) -> Result<Arc<AcmeClient>> {
     let directory_url = if production {
         PRODUCTION_DIRECTORY
     } else {
         STAGING_DIRECTORY
     };
-    let credentials_path = cache_dir.join("acme_account_credentials.json");
-    let cached = std::fs::read_to_string(&credentials_path)
-        .ok()
-        .and_then(|json| serde_json::from_str::<CachedCredentials>(&json).ok());
-    let (key, cached_kid) = match cached {
-        Some(credentials) if credentials.directory_url == directory_url => {
-            match hex_decode(&credentials.account_key_pkcs8_hex)
-                .and_then(|bytes| AccountKey::from_pkcs8(bytes).ok())
-            {
-                Some(key) => (key, Some(credentials.kid)),
-                None => (AccountKey::generate()?, None),
-            }
-        }
-        _ => (AccountKey::generate()?, None),
-    };
-
-    let transport: Arc<dyn Transport> = Arc::new(NagoTransport);
     let directory_response = transport
         .request(HttpRequest {
             method: "GET".into(),
@@ -290,90 +294,37 @@ pub(crate) async fn load_or_create_account(
         transport,
         directory,
         key,
-        cached_kid,
+        None,
         replay_nonce,
     ));
 
-    let needs_registration = client
-        .kid
-        .lock()
-        .expect("ACME kid mutex poisoned")
-        .is_none();
-    if needs_registration {
-        let contact = format!("mailto:{email}");
-        let response = client
-            .post_json(
-                &client.directory.new_account,
-                &json!({"contact":[contact], "termsOfServiceAgreed":true}),
-            )
-            .await?;
-        if !response.is_success() {
-            return Err(Error::Account(format!(
-                "ACME newAccount failed: {}",
-                String::from_utf8_lossy(&response.body)
-            )));
-        }
-        let kid = response
-            .header("Location")
-            .ok_or_else(|| Error::Account("newAccount response omitted Location".into()))?
-            .to_owned();
-        client.set_kid(kid);
-        let credentials = CachedCredentials {
-            directory_url: directory_url.to_owned(),
-            kid: client
-                .kid
-                .lock()
-                .expect("ACME kid mutex poisoned")
-                .clone()
-                .expect("kid was just set"),
-            account_key_pkcs8_hex: hex_encode(client.key.pkcs8()),
-        };
-        let encoded = serde_json::to_vec_pretty(&credentials)
-            .map_err(|error| Error::Account(format!("serialize account credentials: {error}")))?;
-        write_secret_file(&credentials_path, &encoded)?;
+    let payload = match registration_email {
+        Some(email) => json!({
+            "contact": [format!("mailto:{email}")],
+            "termsOfServiceAgreed": true
+        }),
+        None => json!({"onlyReturnExisting": true}),
+    };
+    let response = client
+        .post_json(&client.directory.new_account, &payload)
+        .await?;
+    if !response.is_success() {
+        return Err(Error::Account(format!(
+            "ACME newAccount failed: {}",
+            String::from_utf8_lossy(&response.body)
+        )));
     }
+    if registration_email.is_none() && response.status != 200 {
+        return Err(Error::Account(
+            "ACME existing-account lookup did not return HTTP 200".into(),
+        ));
+    }
+    let kid = response
+        .header("Location")
+        .ok_or_else(|| Error::Account("newAccount response omitted Location".into()))?
+        .to_owned();
+    client.set_kid(kid);
     Ok(client)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
-    if !encoded.len().is_multiple_of(2) {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.as_bytes().as_chunks::<2>().0 {
-        let high = (pair[0] as char).to_digit(16)? as u8;
-        let low = (pair[1] as char).to_digit(16)? as u8;
-        bytes.push((high << 4) | low);
-    }
-    Some(bytes)
-}
-
-pub(crate) fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(bytes)?;
-    Ok(())
 }
 
 /// Build an RFC 8555 DNS-01 key authorization from a challenge token and JWK
@@ -401,9 +352,8 @@ fn generate_csr(domains: &[String]) -> Result<(Vec<u8>, Vec<u8>)> {
     Ok((csr.der().to_vec(), key_pair.serialize_pem().into_bytes()))
 }
 
-pub(crate) fn read_cert_not_after(fullchain_path: &Path) -> Result<SystemTime> {
-    let pem_bytes = std::fs::read(fullchain_path)?;
-    let (_, pem) = parse_x509_pem(&pem_bytes)
+pub(crate) fn read_cert_not_after(fullchain_pem: &[u8]) -> Result<SystemTime> {
+    let (_, pem) = parse_x509_pem(fullchain_pem)
         .map_err(|error| Error::Config(format!("certificate PEM parse: {error}")))?;
     let (_, cert) = X509Certificate::from_der(&pem.contents)
         .map_err(|error| Error::Config(format!("certificate DER parse: {error}")))?;
@@ -461,17 +411,15 @@ pub(crate) async fn issue_certificate<D: DnsProvider>(
     account: &AcmeClient,
     domains: &[String],
     propagation_secs: u64,
-    cert_dir: &Path,
     cancel: Option<&AtomicBool>,
     notify: Option<&nagoya::sync::Notify>,
-) -> Result<()> {
+) -> Result<CertificateMaterial> {
     let mut challenges = Vec::new();
     let result = issue_certificate_inner(
         dns,
         account,
         domains,
         propagation_secs,
-        cert_dir,
         cancel,
         notify,
         &mut challenges,
@@ -491,11 +439,10 @@ async fn issue_certificate_inner<D: DnsProvider>(
     account: &AcmeClient,
     domains: &[String],
     propagation_secs: u64,
-    cert_dir: &Path,
     cancel: Option<&AtomicBool>,
     notify: Option<&nagoya::sync::Notify>,
     cleanup: &mut Vec<ChallengeInfo>,
-) -> Result<()> {
+) -> Result<CertificateMaterial> {
     check_cancelled(cancel)?;
     let identifiers: Vec<Value> = domains
         .iter()
@@ -623,9 +570,7 @@ async fn issue_certificate_inner<D: DnsProvider>(
             "ACME certificate response was not a PEM chain".into(),
         ));
     }
-    std::fs::write(cert_dir.join("fullchain.pem"), &response.body)?;
-    write_secret_file(&cert_dir.join("privkey.pem"), &private_key)?;
-    Ok(())
+    CertificateMaterial::new(response.body, private_key)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -683,7 +628,7 @@ fn check_cancelled(cancel: Option<&AtomicBool>) -> Result<()> {
     }
 }
 
-async fn wait_or_cancel(
+pub(crate) async fn wait_or_cancel(
     cancel: Option<&AtomicBool>,
     notify: Option<&nagoya::sync::Notify>,
     duration: Duration,
@@ -824,6 +769,43 @@ mod tests {
             dns_txt_value(&authorization),
             "lCdftpJCXapaZHkBGIZbcubeKW8RmA0jSG_aZN01zbU"
         );
+    }
+
+    #[test]
+    fn existing_account_lookup_rejects_missing_or_new_accounts() {
+        for (status, body) in [
+            (
+                400,
+                r#"{"type":"urn:ietf:params:acme:error:accountDoesNotExist"}"#,
+            ),
+            (201, "{}"),
+        ] {
+            let fake = Arc::new(FakeTransport::with_responses(vec![
+                response(
+                    200,
+                    &[("Replay-Nonce", "nonce")],
+                    r#"{"newNonce":"https://ca.example/nonce","newAccount":"https://ca.example/account","newOrder":"https://ca.example/order"}"#,
+                ),
+                response(
+                    status,
+                    &[("Location", "https://ca.example/account/1")],
+                    body,
+                ),
+            ]));
+            let key = AccountKey::generate().unwrap();
+            let result = nagoya::block_on(load_existing_account(false, key, fake.clone()));
+            assert!(matches!(result, Err(Error::Account(_))));
+            let requests = fake.requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].method, "POST");
+            assert_eq!(requests[1].url, "https://ca.example/account");
+            let jws: Value = serde_json::from_slice(&requests[1].body.as_ref().unwrap().1).unwrap();
+            let payload = crate::jwk::base64url_decode(jws["payload"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&payload).unwrap(),
+                json!({"onlyReturnExisting": true})
+            );
+        }
     }
 
     #[test]
